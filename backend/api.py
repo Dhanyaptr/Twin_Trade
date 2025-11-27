@@ -1,12 +1,13 @@
 from pydantic import BaseModel
 class CustomRequest(BaseModel):
-    stock: str
+    selected_stocks: list[str]
+    anchor_stock: str
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
 import os, glob
-
+from backend.pair_trading.scripts.pair_selection import get_top_n_pairs,find_best_pair_within_subset
 from backend.pair_trading.scripts.cointegration_utils import (
     find_cointegrated_pairs,
     get_hedge_ratio,
@@ -161,18 +162,25 @@ def dashboard():
 
 @app.post("/custom-mode")
 async def custom_mode(body: CustomRequest):
-    stock = body.stock
+    selected_stocks = body.selected_stocks
+    anchor = body.anchor_stock
 
-    if not stock:
-        return {"status": "error", "message": "Stock symbol is required"}
+    if not selected_stocks or len(selected_stocks) < 2:
+        return {"status": "error", "message": "Select at least 2 stocks."}
 
+    if anchor not in selected_stocks:
+        return {"status": "error", "message": "Anchor stock must be selected in the list."}
+
+    # Load all CSV files
     all_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
     dfs = []
+
     for f in all_files:
         df = pd.read_csv(f)
         df.columns = df.columns.str.strip().str.lower()
         if "date" not in df.columns or "close" not in df.columns:
             continue
+
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"]).set_index("date")
 
@@ -185,84 +193,81 @@ async def custom_mode(body: CustomRequest):
 
     combined_df = pd.concat(dfs, axis=1).ffill()
 
-    if stock not in combined_df.columns:
-        return {"status": "error", "message": f"Stock {stock} not found"}
+    # Keep only user-selected stocks
+    available = [s for s in selected_stocks if s in combined_df.columns]
+    if len(available) < 2:
+        return {"status": "error", "message": "Selected stocks not found in dataset."}
 
-    # --- STEP 1: Build full symmetric pair map ---
-    pairs, _ = find_cointegrated_pairs(combined_df, significance=0.1)
+    user_df = combined_df[available].ffill()
 
-    pair_map = {}
-    for s1, s2, p in pairs:
-        key = tuple(sorted([s1, s2]))  # ensures (A,B) and (B,A) are treated the same
-        if key not in pair_map or p < pair_map[key]:
-            pair_map[key] = p
+    # Cointegration within subset
+    pairs, pval_matrix = find_cointegrated_pairs(user_df, significance=0.1)
 
-    # --- STEP 2: Find all pairs that involve selected stock ---
-    candidates = [(a, b, p) for (a, b), p in pair_map.items() if stock in (a, b)]
+    # Filter pairs that include anchor
+    subset_pairs = [(a, b, p) for (a, b, p) in pairs if anchor in (a, b)]
 
-    # --- STEP 3: Pick the best (lowest p-value) pair ---
-    if not candidates:
-        # fallback: correlation
-        corr_matrix = combined_df.corr()
-        if stock not in corr_matrix.columns:
-            return {"status": "error", "message": f"No data for {stock}"}
-
-        top_corr = corr_matrix[stock].drop(index=stock).sort_values(ascending=False).head(1)
-        if top_corr.empty:
-            return {"status": "error", "message": f"No correlated pair found for {stock}"}
-
-        pair_stock = top_corr.index[0]
-        pval = 0.2
+    # Determine best pair
+    if subset_pairs:
+        a, b, pval = sorted(subset_pairs, key=lambda x: x[2])[0]
+        pair_stock = b if a == anchor else a
     else:
-        a, b, pval = sorted(candidates, key=lambda t: t[2])[0]
-        pair_stock = b if a == stock else a
+        # fallback: top-scoring pair from your utility
+        try:
+            top = get_top_n_pairs(user_df, pval_matrix, n=1)
+            stock1, stock2, pval, corr, score = top[0]
+            pair_stock = stock2 if stock1 == anchor else stock1
+        except:
+            # final fallback: correlation
+            corr_series = user_df.corr()[anchor].drop(anchor)
+            pair_stock = corr_series.idxmax()
+            pval = 1.0
 
-    # --- STEP 4: Ensure consistent spread direction ---
-    stock_a, stock_b = sorted([stock, pair_stock])
-    y = combined_df[stock_a]
-    x = combined_df[stock_b]
-    df_pair = pd.concat([y, x], axis=1).dropna()
+    # ============= Build Pair DataFrame (CORRECT PLACE) =============
+    stock_a = anchor
+    stock_b = pair_stock
 
-    hedge_ratio = get_hedge_ratio(df_pair[stock_a], df_pair[stock_b])
-    spread = calculate_spread(df_pair[stock_a], df_pair[stock_b], hedge_ratio)
+    df_pair = user_df[[stock_a, stock_b]].dropna()
+    if df_pair.empty:
+        return {"status": "error", "message": "Insufficient overlapping data"}
 
-    # rolling stats
+    y = df_pair[stock_a]
+    x = df_pair[stock_b]
+
+    # === Analytics ===
+    hedge_ratio = get_hedge_ratio(y, x)
+    spread = calculate_spread(y, x, hedge_ratio)
+
     rolling_mean = spread.rolling(window=20, min_periods=1).mean()
     rolling_std = spread.rolling(window=20, min_periods=1).std()
     zscore = (spread - rolling_mean) / rolling_std
 
-    # --- Flip sign if user selected reverse stock ---
-    if stock != stock_a:
-        zscore = -zscore
-
-    # correlation
-    y_norm = (df_pair[stock_a] - df_pair[stock_a].mean()) / df_pair[stock_a].std()
-    x_norm = (df_pair[stock_b] - df_pair[stock_b].mean()) / df_pair[stock_b].std()
+    # Rolling correlation
+    y_norm = (y - y.mean()) / y.std()
+    x_norm = (x - x.mean()) / x.std()
     rolling_corr = y_norm.rolling(window=20, min_periods=1).corr(x_norm)
 
-    # signals
-    signals = generate_signals(spread, zscore)
-    signals = list(signals)
+    signals = list(generate_signals(spread, zscore))
     idx = df_pair.index
 
-    # latest recommendation
-    avg_z = np.mean(zscore[-5:]) if len(zscore) > 5 else np.mean(zscore)
+    # Recommendation
+    avg_z = np.mean(zscore[-5:]) if len(zscore) >= 5 else np.mean(zscore)
     if avg_z > 1.2:
-        stock_signal, pair_signal = "SELL", "BUY"
+        anchor_sig, pair_sig = "SELL", "BUY"
     elif avg_z < -1.2:
-        stock_signal, pair_signal = "BUY", "SELL"
+        anchor_sig, pair_sig = "BUY", "SELL"
     else:
-        stock_signal, pair_signal = "HOLD", "HOLD"
+        anchor_sig, pair_sig = "HOLD", "HOLD"
 
     latest_recommendation = {
-        stock: stock_signal,
-        pair_stock: pair_signal
+        stock_a: anchor_sig,
+        stock_b: pair_sig
     }
 
+    # Backtest
     from backend.pair_trading.scripts.cointegration_utils import backtest_pair
     trade_results = backtest_pair(
-        df_pair[stock_a].values,
-        df_pair[stock_b].values,
+        y.values,
+        x.values,
         signals,
         idx,
         stock_a,
@@ -271,15 +276,14 @@ async def custom_mode(body: CustomRequest):
 
     return {
         "status": "ok",
-        "selected_stock": stock,
-        "pair_stock": pair_stock,
-        "pair_order": f"{stock} - {pair_stock}",
+        "anchor": stock_a,
+        "best_pair": [stock_a, stock_b],
         "pvalue": float(pval),
         "hedge_ratio": float(hedge_ratio),
         "latest_recommendation": latest_recommendation,
         "dates": idx.strftime("%Y-%m-%d").tolist(),
-        "stock1_prices": df_pair[stock_a].reindex(idx).tolist(),
-        "stock2_prices": df_pair[stock_b].reindex(idx).tolist(),
+        "stock1_prices": y.tolist(),
+        "stock2_prices": x.tolist(),
         "spread": clean_series(spread),
         "rolling_mean": clean_series(rolling_mean),
         "zscore": clean_series(zscore),

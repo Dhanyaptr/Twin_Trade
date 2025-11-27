@@ -65,6 +65,24 @@ const Dashboard = () => {
   const [autoResult, setAutoResult] = useState<AutomaticModeResult | null>(
     null
   );
+const [selectedStocks, setSelectedStocks] = useState<string[]>([]);
+
+// helper to toggle selections with a limit
+const toggleStockSelection = (symbol: string) => {
+  setSelectedStocks((prev) => {
+    const exists = prev.includes(symbol);
+    if (exists) return prev.filter((s) => s !== symbol);
+    if (prev.length >= 30) {
+      toast({
+        title: "Limit reached",
+        description: "You can select up to 30 stocks only.",
+        variant: "destructive",
+      });
+      return prev;
+    }
+    return [...prev, symbol];
+  });
+};
 
   // NEW: custom result state
   const [customResult, setCustomResult] = useState<AutomaticModeResult | null>(
@@ -96,72 +114,84 @@ const Dashboard = () => {
   };
 
   // ---------- NEW: Custom Mode handler (single-stock) ----------
-  const handleCustomAnalysis = async () => {
-    if (!selectedStockA) {
+const handleCustomAnalysis = async () => {
+  // new validations
+  if (selectedStocks.length === 0) {
+    toast({
+      title: "Select at least one stock",
+      description: "Add stocks to your subset before running analysis.",
+      variant: "destructive",
+    });
+    return;
+  }
+  if (!selectedStockA) {
+    toast({
+      title: "Select primary stock",
+      description: "Choose a stock (A) from your selected list.",
+      variant: "destructive",
+    });
+    return;
+  }
+
+  setIsAnalyzing(true);
+  setCustomResult(null);
+
+  try {
+    const resp = await fetch("http://localhost:8000/custom-mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        selected_stocks: selectedStocks,
+        anchor_stock: selectedStockA,
+      }),
+    });
+
+    const data = await resp.json();
+
+    if (!resp.ok) {
       toast({
-        title: "Please select a stock",
-        description: "Stock A is required for analysis.",
+        title: "Analysis failed",
+        description: data?.message || data?.error || "Server returned an error",
         variant: "destructive",
       });
+      setIsAnalyzing(false);
       return;
     }
 
-    setIsAnalyzing(true);
-    setCustomResult(null);
+    // Map backend fields to frontend expectations (adapt if your backend names differ)
+    const mapped = {
+      ...data,
+      best_pair: data.best_pair ?? [data.anchor, data.best_pair_stock] ?? [selectedStockA, data.best_pair_stock],
+      stock1_prices: data.stock1_prices,
+      stock2_prices: data.stock2_prices,
+      zscore: data.zscore,
+      spread: data.spread,
+      rolling_mean: data.rolling_mean,
+      correlation: data.correlation,
+      dates: data.dates,
+      pvalue: data.pvalue,
+      hedge_ratio: data.hedge_ratio,
+      latest_recommendation: data.latest_recommendation,
+    };
 
-    try {
-      // call backend POST /custom-mode with selected stock
-      const resp = await fetch("http://localhost:8000/custom-mode", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stock: selectedStockA }),
-      });
+    setCustomResult(mapped);
 
-      const data = await resp.json();
+    toast({
+      title: "Analysis complete",
+      description: `Best pair found for ${selectedStockA}: ${mapped.best_pair?.join(" - ")}`,
+    });
+  } catch (err) {
+    console.error("Custom analysis error", err);
+    toast({
+      title: "Network error",
+      description: "Could not reach backend. Check server and try again.",
+      variant: "destructive",
+    });
+  } finally {
+    setIsAnalyzing(false);
+  }
+};
 
-      if (!resp.ok) {
-        toast({
-          title: "Analysis failed",
-          description:
-            data?.message || data?.error || "Server returned an error",
-          variant: "destructive",
-        });
-        setIsAnalyzing(false);
-        return;
-      }
-
-      // Normalize backend response to match chart expectations
-      const mapped = {
-        ...data,
-        best_pair: [data.selected_stock, data.pair_stock], // build the pair
-        stock1_prices: data.stock1_prices,
-        stock2_prices: data.stock2_prices,
-        zscore: data.zscore,
-        spread: data.spread,
-        rolling_mean: data.rolling_mean,
-        correlation: data.correlation,
-        dates: data.dates,
-      };
-
-      setCustomResult(mapped);
-
-      toast({
-        title: "Analysis complete",
-        description: `Best pair found for ${selectedStockA}: ${mapped.best_pair.join(
-          " - "
-        )}`,
-      });
-    } catch (err) {
-      console.error("Custom analysis error", err);
-      toast({
-        title: "Network error",
-        description: "Could not reach backend. Check server and try again.",
-        variant: "destructive",
-      });
-    } finally {
-      setIsAnalyzing(false);
-    }
-  };
 
   // Helper: compute actions per index from zscore
   // Based on conventional pair-trading signals:
@@ -567,228 +597,194 @@ const Dashboard = () => {
 
           {/* ----------------- CUSTOM MODE (ONLY STOCK A) ----------------- */}
           <TabsContent value="custom" className="space-y-6">
-            <Card className="shadow-card">
-              <CardHeader>
-                <CardTitle className="flex items-center space-x-2">
-                  <Settings className="h-5 w-5" />
-                  <span>Custom Pair Analysis</span>
-                </CardTitle>
-                <CardDescription>
-                  Select one stock — system will find the best pair
-                </CardDescription>
-              </CardHeader>
+  <Card className="shadow-card">
+    <CardHeader>
+      <CardTitle className="flex items-center space-x-2">
+        <Settings className="h-5 w-5" />
+        <span>Custom Pair Analysis</span>
+      </CardTitle>
+      <CardDescription>
+        Select up to 30 stocks (left) and choose a primary stock (right).
+      </CardDescription>
+    </CardHeader>
 
-              <CardContent className="space-y-6">
-                {/* Stock selection */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">Stock (A)</label>
-                    <Select
-                      value={selectedStockA}
-                      onValueChange={setSelectedStockA}
-                    >
-                      <SelectTrigger>
-                        <SelectValue placeholder="Select stock" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {stockOptions.map((stock) => (
-                          <SelectItem key={stock} value={stock}>
-                            {stock}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+    <CardContent className="space-y-6">
+      {/* Layout: left = subset selector, right = anchor */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
+        {/* Left: subset selector */}
+        <div>
+          <label className="text-sm font-medium inline-block mb-2">
+            Your Stocks (select up to 30)
+          </label>
+
+          <div className="mt-2 p-3 border rounded-lg bg-card max-h-72 overflow-auto">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              {stockOptions.map((stock) => {
+                const checked = selectedStocks.includes(stock);
+                return (
+                  <label
+                    key={stock}
+                    className={`flex items-center gap-2 text-sm px-2 py-1 rounded cursor-pointer border ${
+                      checked ? "bg-primary/10 border-primary" : "border-transparent"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggleStockSelection(stock)}
+                      className="w-4 h-4 rounded focus:ring-2 focus:ring-primary"
+                    />
+                    <span className="truncate">{stock}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="mt-2 text-xs text-muted-foreground">
+            Selected: <span className="font-medium">{selectedStocks.length}</span> / 10
+          </div>
+
+          {/* Chips with remove */}
+          <div className="flex gap-2 flex-wrap mt-3">
+            {selectedStocks.map((s) => (
+              <div
+                key={s}
+                className="px-3 py-1 rounded-md bg-muted text-sm flex items-center gap-2"
+              >
+                <span className="max-w-[90px] truncate">{s}</span>
+                <button
+                  onClick={() => toggleStockSelection(s)}
+                  className="text-xs text-muted-foreground hover:text-foreground"
+                  aria-label={`Remove ${s}`}
+                  type="button"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Right: anchor selector */}
+        <div>
+          <label className="text-sm font-medium inline-block mb-2">Stock (A) - Primary Stock</label>
+
+          <Select value={selectedStockA} onValueChange={setSelectedStockA}>
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="Select anchor stock from your list" />
+            </SelectTrigger>
+
+            {/* ensure dropdown sits on top of other containers */}
+            <SelectContent className="w-full max-h-60 overflow-auto z-50">
+              {selectedStocks.length > 0 ? (
+                selectedStocks.map((stock) => (
+                  <SelectItem key={stock} value={stock}>
+                    {stock}
+                  </SelectItem>
+                ))
+              ) : (
+                <div className="p-3 text-sm text-muted-foreground">
+                  Select stocks from the left to choose an anchor.
+                </div>
+              )}
+            </SelectContent>
+          </Select>
+
+          <div className="mt-3 text-xs text-muted-foreground">
+            Tip: pick the most important stock in your portfolio as the primary stock.
+          </div>
+        </div>
+      </div>
+
+      {/* Run analysis */}
+      <div className="mt-4">
+        <Button
+          variant="gradient"
+          onClick={handleCustomAnalysis}
+          disabled={isAnalyzing || selectedStocks.length < 2 || !selectedStockA}
+          className="w-full md:w-auto"
+        >
+          {isAnalyzing ? "Running Analysis..." : "Run Analysis"}
+        </Button>
+
+        {(selectedStocks.length < 2 || !selectedStockA) && (
+          <div className="text-xs text-muted-foreground mt-2">
+            Select at least 2 stocks and choose an anchor to run analysis.
+          </div>
+        )}
+      </div>
+
+      {/* Results or placeholder */}
+      {customResult ? (
+        (() => {
+          const series = buildSeries(customResult);
+          const pairName = customResult.best_pair?.join(" - ") ?? `${selectedStockA} - Pair`;
+
+          return (
+            <div className="space-y-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-lg font-semibold">Best Pair: {pairName}</h3>
+                  <div className="text-sm text-muted-foreground">
+                    Hedge ratio: {customResult.hedge_ratio?.toFixed(3) ?? "N/A"} • P-value: {customResult.pvalue ?? "N/A"}
                   </div>
                 </div>
 
-                {/* Run analysis button */}
-                <Button
-                  variant="gradient"
-                  onClick={handleCustomAnalysis}
-                  disabled={isAnalyzing || !selectedStockA}
-                  className="w-full md:w-auto"
-                >
-                  {isAnalyzing ? "Running Analysis..." : "Run Analysis"}
-                </Button>
+                <div className="text-right">
+                  <div className="text-sm font-medium text-muted-foreground mb-1">Latest Recommendation</div>
+                  {customResult.latest_recommendation ? (
+                    <div className="flex justify-end flex-wrap gap-2 mt-1">
+                      {Object.entries(customResult.latest_recommendation).map(([symbol, action]) => (
+                        <span
+                          key={symbol}
+                          className={`px-3 py-1 rounded font-semibold ${
+                            action === "BUY" ? "bg-success/10 text-success" : action === "SELL" ? "bg-destructive/10 text-destructive" : "bg-muted text-muted-foreground"
+                          }`}
+                        >
+                          {symbol}: {action}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-sm text-muted-foreground">No active signal</div>
+                  )}
+                </div>
+              </div>
 
-                {/* Results: charts and recommendations */}
-                {customResult ? (
-                  (() => {
-                    const series = buildSeries(customResult);
-                    const pairName =
-                      customResult.best_pair?.join(" - ") ??
-                      `${selectedStockA} - Pair`;
-
-                    return (
-                      <div className="space-y-6">
-                        {/* Pair info and recommendation */}
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <h3 className="text-lg font-semibold">
-                              Best Pair: {pairName}
-                            </h3>
-                            <div className="text-sm text-muted-foreground">
-                              Hedge ratio:{" "}
-                              {customResult.hedge_ratio?.toFixed(3) ?? "N/A"} •
-                              P-value: {customResult.pvalue ?? "N/A"}
-                            </div>
-                          </div>
-
-                          <div className="text-right">
-                            <div className="text-sm font-medium text-muted-foreground mb-1">
-                              Latest Recommendation
-                            </div>
-                            {customResult.latest_recommendation ? (
-                              <div className="flex justify-end flex-wrap gap-2 mt-1">
-                                {Object.entries(
-                                  customResult.latest_recommendation
-                                ).map(([symbol, action]) => (
-                                  <span
-                                    key={symbol}
-                                    className={`px-3 py-1 rounded font-semibold ${
-                                      action === "BUY"
-                                        ? "bg-success/10 text-success"
-                                        : action === "SELL"
-                                        ? "bg-destructive/10 text-destructive"
-                                        : "bg-muted text-muted-foreground"
-                                    }`}
-                                  >
-                                    {symbol}: {action}
-                                  </span>
-                                ))}
-                              </div>
-                            ) : (
-                              <div className="text-sm text-muted-foreground">
-                                No active signal
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* --- Charts Section --- */}
-
-                        {/* 1️⃣ Price Chart with Buy/Sell markers */}
-                        <Card>
-                          <CardHeader>
-                            <CardTitle>Price Comparison</CardTitle>
-                          </CardHeader>
-                          <CardContent>
-                            <div style={{ width: "100%", height: 320 }}>
-                              <ResponsiveContainer>
-                                <LineChart
-                                  data={series}
-                                  margin={{
-                                    top: 10,
-                                    right: 20,
-                                    left: 0,
-                                    bottom: 0,
-                                  }}
-                                >
-                                  <CartesianGrid strokeDasharray="3 3" />
-                                  <XAxis
-                                    dataKey="date"
-                                    tick={{ fontSize: 9 }}
-                                    angle={-45}
-                                    textAnchor="end"
-                                    interval="preserveStartEnd"
-                                    height={60}
-                                    label={{
-                                      value: "Date",
-                                      position: "insideBottom",
-                                      offset: -4,
-                                      style: {
-                                        textAnchor: "middle",
-                                        fontWeight: "bold",
-                                        fill: "#000000",
-                                      },
-                                    }}
-                                  />
-                                  <YAxis
-                                    tick={{ fontSize: 12 }}
-                                    label={{
-                                      value: "Price (₹)",
-                                      angle: -90,
-                                      position: "insideLeft",
-                                      style: {
-                                        textAnchor: "middle",
-                                        fontWeight: "bold",
-                                        fill: "#000000",
-                                      },
-                                    }}
-                                  />
-                                  <Tooltip />
-                                  <Legend />
-                                  <Line
-                                    type="monotone"
-                                    dataKey="stock1"
-                                    name={selectedStockA}
-                                    stroke="#2563eb"
-                                    dot={false}
-                                  />
-                                  <Line
-                                    type="monotone"
-                                    dataKey="stock2"
-                                    name={customResult.best_pair?.[1] ?? "PAIR"}
-                                    stroke="#ef4444"
-                                    dot={false}
-                                  />
-                                  {/* Markers for buy/sell */}
-                                  {series.map((d, i) => {
-                                    const x = d.date;
-                                    const yA = d.stock1;
-                                    const yB = d.stock2;
-                                    const markers = [];
-                                    if (d.actionA === "BUY")
-                                      markers.push(
-                                        <ReferenceDot
-                                          key={`A-buy-${i}`}
-                                          x={x}
-                                          y={yA}
-                                          r={4}
-                                          stroke="green"
-                                          fill="green"
-                                        />
-                                      );
-                                    else if (d.actionA === "SELL")
-                                      markers.push(
-                                        <ReferenceDot
-                                          key={`A-sell-${i}`}
-                                          x={x}
-                                          y={yA}
-                                          r={4}
-                                          stroke="red"
-                                          fill="red"
-                                        />
-                                      );
-                                    if (d.actionB === "BUY")
-                                      markers.push(
-                                        <ReferenceDot
-                                          key={`B-buy-${i}`}
-                                          x={x}
-                                          y={yB}
-                                          r={4}
-                                          stroke="green"
-                                          fill="green"
-                                        />
-                                      );
-                                    else if (d.actionB === "SELL")
-                                      markers.push(
-                                        <ReferenceDot
-                                          key={`B-sell-${i}`}
-                                          x={x}
-                                          y={yB}
-                                          r={4}
-                                          stroke="red"
-                                          fill="red"
-                                        />
-                                      );
-                                    return markers;
-                                  })}
-                                </LineChart>
-                              </ResponsiveContainer>
-                            </div>
-                          </CardContent>
-                        </Card>
+              {/* Charts — keep existing charts layout (price, zscore, rolling mean, correlation) */}
+              <Card>
+                <CardHeader>
+                  <CardTitle>Price Comparison</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div style={{ width: "100%", height: 320 }}>
+                    <ResponsiveContainer>
+                      <LineChart data={series} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey="date" tick={{ fontSize: 9 }} angle={-45} textAnchor="end" interval="preserveStartEnd" height={60} label={{ value: "Date", position: "insideBottom", offset: -4, style: { textAnchor: "middle", fontWeight: "bold", fill: "#000000" } }} />
+                        <YAxis tick={{ fontSize: 12 }} label={{ value: "Price (₹)", angle: -90, position: "insideLeft", style: { textAnchor: "middle", fontWeight: "bold", fill: "#000000" } }} />
+                        <Tooltip />
+                        <Legend />
+                        <Line type="monotone" dataKey="stock1" name={selectedStockA} stroke="#2563eb" dot={false} />
+                        <Line type="monotone" dataKey="stock2" name={customResult.best_pair?.[1] ?? "PAIR"} stroke="#ef4444" dot={false} />
+                        {/* markers */}
+                        {series.map((d, i) => {
+                          const x = d.date;
+                          const yA = d.stock1;
+                          const yB = d.stock2;
+                          const markers: React.ReactNode[] = [];
+                          if (d.actionA === "BUY") markers.push(<ReferenceDot key={`A-buy-${i}`} x={x} y={yA} r={4} stroke="green" fill="green" />);
+                          else if (d.actionA === "SELL") markers.push(<ReferenceDot key={`A-sell-${i}`} x={x} y={yA} r={4} stroke="red" fill="red" />);
+                          if (d.actionB === "BUY") markers.push(<ReferenceDot key={`B-buy-${i}`} x={x} y={yB} r={4} stroke="green" fill="green" />);
+                          else if (d.actionB === "SELL") markers.push(<ReferenceDot key={`B-sell-${i}`} x={x} y={yB} r={4} stroke="red" fill="red" />);
+                          return markers;
+                        })}
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </CardContent>
+              </Card>
 
                         {/* 2️⃣ Z-score and Spread */}
                         <Card>
